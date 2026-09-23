@@ -5,26 +5,35 @@ if (!fs.existsSync('screenshots')) {
   fs.mkdirSync('screenshots');
 }
 
+// ===== FreeMCHost 认证配置（站点使用 Supabase Auth，会话存储在 localStorage）=====
+// 站点前端为 Lovable + Supabase 构建，登录表单带 bylegit 反机器人组件，直接驱动表单易被拦截。
+// 改为：通过 Supabase REST API 用邮箱密码换取 session（REST 接口无 captcha 校验），
+//       再把 session 注入 localStorage（键 sb-<project-ref>-auth-token），跳过登录表单。
+//       也可用 FREE_SESSION 直接注入预先导出的会话（纯 token 登录，免密码）。
+const SUPABASE_URL = 'https://laehfeigoiycigkfknfn.supabase.co';
+const SUPABASE_ANON_KEY = 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6ImxhZWhmZWlnb2l5Y2lna2ZrbmZuIiwicm9sZSI6ImFub24iLCJpYXQiOjE3ODAyNzk1NTgsImV4cCI6MjA5NTg1NTU1OH0.r-CQTnTFWYj5Vawvn1Ky91QnPJMcp1feIRFWJrhq7T8';
+const STORAGE_KEY = 'sb-laehfeigoiycigkfknfn-auth-token';
+
 // Telegram 通知工具
 async function sendTelegramMessage(botToken, chatId, text) {
   if (!botToken || !chatId) {
     console.log('⚠️ 未配置 TG_BOT_TOKEN 或 TG_CHAT_ID，跳过通知。');
     return;
   }
-  
+
   const url = `https://api.telegram.org/bot${botToken}/sendMessage`;
   try {
     const res = await fetch(url, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ 
-        chat_id: chatId, 
-        text: text, 
+      body: JSON.stringify({
+        chat_id: chatId,
+        text: text,
         parse_mode: 'HTML',
-        disable_web_page_preview: true 
+        disable_web_page_preview: true
       })
     });
-    
+
     const result = await res.json();
     if (result.ok) {
       console.log('📢 TG 通知已成功送达！');
@@ -108,29 +117,13 @@ async function forceDismissPopups(page) {
       }
     });
 
-    const backdrops = allEls.filter(el => 
+    const backdrops = allEls.filter(el =>
       el.classList && el.classList.contains('fixed') && el.classList.contains('inset-0') && el.getAttribute('data-state') === 'open'
     );
     backdrops.forEach(b => b.remove());
   });
 
   await page.waitForTimeout(200);
-}
-
-// 模拟真实用户输入
-async function safeFill(page, locator, value, label) {
-  await locator.waitFor({ state: 'visible', timeout: 15000 });
-  await locator.click();
-  await locator.focus();
-  await locator.fill(value);
-  await page.waitForTimeout(300);
-
-  const actualVal = await locator.inputValue().catch(() => '');
-  if (!actualVal) {
-    console.log(`⚠️ 检测到 ${label} 输入框为空，尝试键盘逐字写入...`);
-    await locator.click();
-    await locator.pressSequentially(value, { delay: 30 });
-  }
 }
 
 // 切换至 PLAN Billing 标签页
@@ -196,9 +189,57 @@ async function safeScreenshot(page, filePath) {
   }
 }
 
-(async () => {
+// ===== 会话获取：优先 FREE_SESSION（纯 token），否则 Supabase REST 邮箱密码登录 =====
+async function obtainSession() {
+  // 模式 B：直接注入预先导出的会话（从浏览器 localStorage 复制的 sb-...-auth-token 值）
+  const rawSession = (process.env.FREE_SESSION || '').trim();
+  if (rawSession) {
+    try {
+      const sess = JSON.parse(rawSession);
+      if (sess && sess.access_token) {
+        console.log('🔑 使用 FREE_SESSION 注入会话（纯 token 登录，跳过密码）...');
+        return sess;
+      }
+      console.warn('⚠️ FREE_SESSION 缺少 access_token，回退到邮箱密码登录。');
+    } catch (e) {
+      console.warn(`⚠️ FREE_SESSION 解析失败(${e.message})，回退到邮箱密码登录。`);
+    }
+  }
+
+  // 模式 A：Supabase REST API 邮箱密码登录（绕过 bylegit 表单，无 captcha）
   const email = (process.env.FREE_EMAIL || '').trim();
   const password = (process.env.FREE_PASSWORD || '').trim();
+  if (!email || !password) {
+    throw new Error('未配置 FREE_SESSION，也未配置 FREE_EMAIL/FREE_PASSWORD，无法获取会话。');
+  }
+
+  console.log(`🔐 通过 Supabase REST API 登录 (${email})...`);
+  const res = await fetch(`${SUPABASE_URL}/auth/v1/token?grant_type=password`, {
+    method: 'POST',
+    headers: {
+      'apikey': SUPABASE_ANON_KEY,
+      'Content-Type': 'application/json'
+    },
+    body: JSON.stringify({ email, password })
+  });
+
+  let data;
+  try {
+    data = await res.json();
+  } catch (e) {
+    throw new Error(`Supabase 登录响应解析失败: HTTP ${res.status}`);
+  }
+
+  if (!res.ok || !data || !data.access_token) {
+    const msg = (data && (data.msg || data.error_description || data.error_code)) || `HTTP ${res.status}`;
+    throw new Error(`Supabase 登录失败: ${msg}`);
+  }
+
+  console.log(`✅ REST 登录成功 (user: ${data.user?.email || data.user?.id})`);
+  return data; // { access_token, refresh_token, token_type, expires_in, expires_at, user }
+}
+
+(async () => {
   const rawUrls = (process.env.SERVER_PAGE_URL || '').trim();
   const proxyUrl = (process.env.PROXY_URL || '').trim();
   const tgToken = (process.env.TG_BOT_TOKEN || '').trim();
@@ -209,12 +250,18 @@ async function safeScreenshot(page, filePath) {
     .map(u => u.trim())
     .filter(u => u.startsWith('http'));
 
-  if (!email || !password || serverUrls.length === 0) {
-    console.error('❌ 缺失账号、密码或有效的 SERVER_PAGE_URL 地址！');
+  const hasSession = !!(process.env.FREE_SESSION || '').trim();
+  const hasPassword = !!(process.env.FREE_EMAIL || '').trim() && !!(process.env.FREE_PASSWORD || '').trim();
+
+  if ((!hasSession && !hasPassword) || serverUrls.length === 0) {
+    console.error('❌ 缺失凭据（需配置 FREE_SESSION 或 FREE_EMAIL/FREE_PASSWORD）或有效的 SERVER_PAGE_URL！');
     process.exit(1);
   }
 
   console.log(`📋 检测到 ${serverUrls.length} 个独立服务器地址待巡检...`);
+
+  // 先获取会话（REST 登录或 FREE_SESSION）
+  const session = await obtainSession();
 
   const browser = await chromium.launch({
     headless: true,
@@ -236,6 +283,18 @@ async function safeScreenshot(page, filePath) {
   await context.addInitScript(() => {
     Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
   });
+
+  // 💉 核心：在每个页面脚本执行前，把 Supabase 会话写入 localStorage，
+  //        使 SPA 加载时即处于已登录状态，无需经过 /login 表单（绕过 bylegit）。
+  const sessionJson = JSON.stringify(session);
+  await context.addInitScript(({ key, value }) => {
+    try {
+      if (location.hostname.endsWith('freemchost.com')) {
+        localStorage.setItem(key, value);
+      }
+    } catch (e) {}
+  }, { key: STORAGE_KEY, value: sessionJson });
+  console.log('💉 Supabase 会话已注入 localStorage，跳过登录表单。');
 
   const page = await context.newPage();
 
@@ -260,25 +319,16 @@ async function safeScreenshot(page, filePath) {
   let reports = [];
 
   try {
-    console.log('🚀 正在打开 FreeMCHost 登录页...');
-    await page.goto('https://freemchost.com/login', { waitUntil: 'domcontentloaded', timeout: 60000 });
-    await page.waitForTimeout(2000);
+    // 先访问 /app 验证会话注入是否生效（未登录会被重定向到 /login）
+    console.log('🚀 正在校验会话有效性 (打开 /app)...');
+    await page.goto('https://freemchost.com/app', { waitUntil: 'domcontentloaded', timeout: 60000 });
+    await page.waitForTimeout(3000);
     await forceDismissPopups(page);
 
-    console.log('📝 正在输入账号密码...');
-    const emailLocator = page.locator('input[type="email"], input[name="email"]').first();
-    const passLocator = page.locator('input[type="password"], input[name="password"]').first();
-
-    await safeFill(page, emailLocator, email, 'Email');
-    await safeFill(page, passLocator, password, 'Password');
-
-    console.log('🔐 正在触发登录...');
-    const signInBtn = page.locator('button:has-text("Sign in"), button[type="submit"]').first();
-    await Promise.all([
-      page.waitForURL(url => !url.href.includes('/login'), { timeout: 45000 }),
-      signInBtn.click()
-    ]);
-    console.log('✅ 登录成功！');
+    if (page.url().includes('/login')) {
+      throw new Error('会话注入后仍被重定向到 /login —— 会话无效或已过期，请检查 FREE_SESSION 或 FREE_EMAIL/FREE_PASSWORD。');
+    }
+    console.log('✅ 会话注入成功，已通过认证！');
 
     for (let i = 0; i < serverUrls.length; i++) {
       const currentUrl = serverUrls[i];
@@ -290,6 +340,10 @@ async function safeScreenshot(page, filePath) {
         await page.goto(currentUrl, { waitUntil: 'domcontentloaded', timeout: 60000 });
         await page.waitForTimeout(3000);
         await forceDismissPopups(page);
+
+        if (page.url().includes('/login')) {
+          throw new Error('访问服务器页被重定向到 /login，会话失效。');
+        }
 
         console.log('🗂️ 正在定位并点击 [PLAN Billing] 标签页...');
         await switchToBillingTab(page);
@@ -333,8 +387,8 @@ async function safeScreenshot(page, filePath) {
           // 核心加固：直接在浏览器内部定位包含 60 hours 的卡片，并派发全套鼠标/指针事件链
           const clickedTarget = await page.evaluate(() => {
             const allEls = Array.from(document.querySelectorAll('*'));
-            const textEl = allEls.find(el => 
-              el.children.length === 0 && 
+            const textEl = allEls.find(el =>
+              el.children.length === 0 &&
               el.textContent.trim().toLowerCase().includes('60 hours')
             );
             if (!textEl) return '未找到文本节点';
@@ -434,7 +488,7 @@ async function safeScreenshot(page, filePath) {
     }
 
     // 汇总推送 Telegram 报告
-    const summaryMsg = `🤖 <b>FreeMCHost 巡检报告</b>\n\n${reports.join('\n')}\n\n<b>检查周期:</b> 每 12 小时自动巡检\n<b>规则:</b> 触发低于 46h 门槛时自动加满 60h\n<b>时间:</b> ${new Date().toLocaleString('zh-CN', { timeZone: 'Asia/Shanghai' })}`;
+    const summaryMsg = `🤖 <b>FreeMCHost 巡检报告</b>\n\n${reports.join('\n')}\n\n<b>检查周期:</b> 每 6 小时自动巡检\n<b>登录方式:</b> Supabase 会话注入\n<b>时间:</b> ${new Date().toLocaleString('zh-CN', { timeZone: 'Asia/Shanghai' })}`;
     await sendTelegramMessage(tgToken, tgChatId, summaryMsg);
 
   } catch (error) {
