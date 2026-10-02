@@ -63,73 +63,78 @@ async function resetOnlineTimer(page) {
     const consoleTab = page.locator('[role="tab"]:has-text("Console"), button:has-text("Console"), a:has-text("Console")').first();
     if (await consoleTab.isVisible({ timeout: 2000 }).catch(() => false)) {
       await consoleTab.click({ force: true }).catch(() => {});
-      await page.waitForTimeout(1200);
+      await page.waitForTimeout(1000);
     }
   } catch (e) {}
 
   await cleanPopup(page);
   await checkAndWakeServer(page);
 
+  // 关键优化：等待控制台 WebSocket 握手完毕并成功渲染出 Online 倒计时（最多等 15 秒）
+  console.log('⏳ 等待控制台 WebSocket 连通与 Online 状态渲染...');
+  try {
+    await page.waitForFunction(() => {
+      const text = document.body ? (document.body.innerText || '') : '';
+      return /Online\s+\d+:\d+/i.test(text);
+    }, { timeout: 15000 });
+  } catch (e) {
+    console.log('⚠️ 等待 Online 倒计时渲染超时，继续尝试提取当前 DOM...');
+  }
+
   // 2. 提取当前 Online 倒计时信息
-  const timerInfo = await page.evaluate(() => {
-    const allEls = Array.from(document.querySelectorAll('*'));
-    // 寻找包含 Online 字样的元素
-    const onlineEl = allEls.find(el => {
-      const text = (el.innerText || el.textContent || '').trim();
-      return /Online\s+\d+:\d+/i.test(text) && text.length < 60;
-    });
-
-    if (onlineEl) {
-      const m = onlineEl.textContent.match(/Online\s*(\d+:\d+)/i);
-      return {
-        found: true,
-        text: onlineEl.textContent.trim(),
-        time: m ? m[1] : null
-      };
-    }
-
-    // 兜底找 body 全文
+  const beforeTimeStr = await page.evaluate(() => {
     const bodyMatch = (document.body.innerText || '').match(/Online\s*(\d+:\d+)/i);
-    if (bodyMatch) {
-      return { found: true, text: bodyMatch[0], time: bodyMatch[1] };
-    }
+    return bodyMatch ? bodyMatch[1] : null;
+  }) || '未识别到具体剩余';
 
-    return { found: false, text: null, time: null };
-  });
-
-  const beforeTimeStr = timerInfo.found ? (timerInfo.time || timerInfo.text) : '未识别到具体剩余';
   console.log(`⏱️ 操作前在线倒计时: ${beforeTimeStr}`);
 
   // 3. 定位 Reset 按钮并执行点击
   let resetClicked = false;
 
-  // 策略 A: 优先查找包含 Reset 文本的可交互按钮/链接
-  const resetLocators = [
-    page.locator('button:has-text("Reset")').first(),
-    page.locator('a:has-text("Reset")').first(),
-    page.locator('[role="button"]:has-text("Reset")').first(),
-    page.locator('span:has-text("Reset")').first(),
-    page.locator('div:has-text("Reset")').filter({ hasText: /^Reset$/ }).first()
-  ];
+  // 策略 A: 精确匹配文本为 Reset 的可点击元素
+  try {
+    const exactReset = page.getByText('Reset', { exact: true }).first();
+    if (await exactReset.isVisible({ timeout: 3000 }).catch(() => false)) {
+      console.log('🎯 命中精确匹配的 Reset 按钮，准备模拟用户点击...');
+      await exactReset.scrollIntoViewIfNeeded().catch(() => {});
+      await exactReset.hover().catch(() => {});
+      await page.waitForTimeout(300);
+      await exactReset.click({ force: true });
+      resetClicked = true;
+      console.log('👆 已成功触发 Reset 按钮点击！');
+    }
+  } catch (e) {}
 
-  for (const loc of resetLocators) {
-    try {
-      if (await loc.isVisible({ timeout: 1000 })) {
-        console.log('🎯 定位到 Reset 按钮，准备模拟用户点击...');
-        await loc.scrollIntoViewIfNeeded().catch(() => {});
-        await loc.hover().catch(() => {});
-        await page.waitForTimeout(250);
-        await loc.click({ force: true });
-        resetClicked = true;
-        console.log('👆 已成功触发 Reset 按钮点击！');
-        break;
-      }
-    } catch (e) {}
+  // 策略 B: 常见按钮/链接选择器备用
+  if (!resetClicked) {
+    const resetLocators = [
+      page.locator('button:has-text("Reset")').first(),
+      page.locator('a:has-text("Reset")').first(),
+      page.locator('[role="button"]:has-text("Reset")').first(),
+      page.locator('span:has-text("Reset")').first(),
+      page.locator('div:has-text("Reset")').filter({ hasText: /^Reset$/ }).first()
+    ];
+
+    for (const loc of resetLocators) {
+      try {
+        if (await loc.isVisible({ timeout: 1500 }).catch(() => false)) {
+          console.log('🎯 备用选择器定位到 Reset 按钮，触发点击...');
+          await loc.scrollIntoViewIfNeeded().catch(() => {});
+          await loc.hover().catch(() => {});
+          await page.waitForTimeout(250);
+          await loc.click({ force: true });
+          resetClicked = true;
+          console.log('👆 备用选择器已成功触发 Reset 点击！');
+          break;
+        }
+      } catch (e) {}
+    }
   }
 
-  // 策略 B: 深度 DOM 探测靠近 Online 节点的 Reset 元素
+  // 策略 C: 深度 DOM 穿透查找 Online 旁边的可点击 Reset
   if (!resetClicked) {
-    console.log('🔄 尝试通过 DOM 树结构穿透定位 Reset 元素...');
+    console.log('🔄 尝试通过 DOM 树结构深度定位并触发 Reset 点击...');
     const clickedByEval = await page.evaluate(() => {
       const elements = Array.from(document.querySelectorAll('*'));
       for (const el of elements) {
@@ -151,18 +156,25 @@ async function resetOnlineTimer(page) {
     }
   }
 
-  // 缓冲等待 3 秒使服务器刷新倒计时
-  await page.waitForTimeout(3000);
-  await cleanPopup(page);
+  // 4. 等待服务器回传并捕获重置后的倒计时
+  let afterTimeStr = null;
+  console.log('⏳ 正在等待在线倒计时刷新确认...');
+  for (let round = 0; round < 8; round++) {
+    await page.waitForTimeout(800);
+    afterTimeStr = await page.evaluate(() => {
+      const bodyMatch = (document.body.innerText || '').match(/Online\s*(\d+:\d+)/i);
+      return bodyMatch ? bodyMatch[1] : null;
+    });
+    // 如果倒计时发生变化（例如从 38:51 变成了 50:00 或更高），说明已刷新成功
+    if (afterTimeStr && afterTimeStr !== beforeTimeStr) {
+      console.log(`🎉 倒计时已成功变更为最新时间: ${afterTimeStr}`);
+      resetClicked = true;
+      break;
+    }
+  }
 
-  // 4. 再次获取点击后的倒计时
-  const afterTimerInfo = await page.evaluate(() => {
-    const bodyMatch = (document.body.innerText || '').match(/Online\s*(\d+:\d+)/i);
-    return bodyMatch ? bodyMatch[1] : null;
-  });
-
-  const afterTimeStr = afterTimerInfo || '已提交刷新';
-  console.log(`✅ 在线状态重置完成: [${beforeTimeStr}] ➔ [${afterTimeStr}]`);
+  afterTimeStr = afterTimeStr || beforeTimeStr || '已提交刷新';
+  console.log(`✅ 在线状态重置流程完成: [${beforeTimeStr}] ➔ [${afterTimeStr}] (${resetClicked ? '成功' : '未触发'})`);
 
   // 保存操作后的控制台凭据截图
   try {
@@ -197,7 +209,7 @@ async function extractExpiryTime(page) {
             const min = parseInt(m[3], 10);
             return { totalHours: d * 24 + h + min / 60, raw: `${d}天${h}小时${min}分` };
           }
-          container = header.parentElement;
+          container = container.parentElement;
         }
       }
     }
