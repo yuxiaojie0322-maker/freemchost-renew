@@ -2,16 +2,45 @@ const { chromium } = require('playwright');
 const fs = require('fs');
 const path = require('path');
 
-// Telegram 消息推送
-async function sendTG(botToken, chatId, text) {
+// Telegram 消息与截图推送
+async function sendTG(botToken, chatId, text, photoPath) {
   if (!botToken || !chatId) return;
   try {
+    // 优先尝试发送图片（带文字标题 Caption）
+    if (photoPath && fs.existsSync(photoPath)) {
+      try {
+        const fileBuffer = fs.readFileSync(photoPath);
+        const blob = new Blob([fileBuffer], { type: 'image/png' });
+        const formData = new FormData();
+        formData.append('chat_id', chatId);
+        formData.append('caption', text.substring(0, 1024)); // Telegram caption 最多 1024 字符
+        formData.append('parse_mode', 'HTML');
+        formData.append('photo', blob, path.basename(photoPath));
+
+        const res = await fetch(`https://api.telegram.org/bot${botToken}/sendPhoto`, {
+          method: 'POST',
+          body: formData
+        });
+
+        if (res.ok) {
+          console.log('📨 Telegram 截图与图文报告推送成功！');
+          return;
+        } else {
+          const errData = await res.text();
+          console.log(`⚠️ sendPhoto 接口返回错误 (${errData})，自动回退到纯文本推送...`);
+        }
+      } catch (err) {
+        console.log(`⚠️ 发送图片过程异常 (${err.message})，自动回退到纯文本推送...`);
+      }
+    }
+
+    // 回退到纯文本发送
     await fetch(`https://api.telegram.org/bot${botToken}/sendMessage`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ chat_id: chatId, text, parse_mode: 'HTML' })
     });
-    console.log('📨 Telegram 状态推送成功');
+    console.log('📨 Telegram 纯文本推送成功');
   } catch (e) {
     console.log('⚠️ Telegram 推送失败:', e.message);
   }
@@ -167,7 +196,7 @@ async function resetOnlineTimer(page) {
     }
   }
 
-  // 4. 等待后端处理并推送刷新后的倒计时（通常会跳变回 44~45 分钟满额）
+  // 4. 等待后端处理并推送刷新后的倒计时
   let afterTimeStr = null;
   console.log('⏳ 正在等待在线倒计时刷新确认...');
   for (let round = 0; round < 10; round++) {
@@ -177,7 +206,6 @@ async function resetOnlineTimer(page) {
       return bodyMatch ? bodyMatch[1] : null;
     });
     const afterSeconds = parseMinutesSeconds(afterTimeStr);
-    // 判断是否真正重置成功：时间应当显著拉长（大于之前时间且大于 40 分钟）
     if (afterSeconds > beforeSeconds && afterSeconds >= 40 * 60) {
       console.log(`🎉 倒计时已成功变更为重置后满额时间: ${afterTimeStr}`);
       resetClicked = true;
@@ -189,17 +217,19 @@ async function resetOnlineTimer(page) {
   console.log(`✅ 在线状态重置流程完成: [${beforeTimeStr}] ➔ [${afterTimeStr}] (${resetClicked ? '成功' : '未触发'})`);
 
   // 保存操作后的控制台凭据截图
+  let savedScreenshot = null;
   try {
     fs.mkdirSync('screenshots', { recursive: true });
-    const screenPath = path.join('screenshots', `reset-${Date.now()}.png`);
-    await page.screenshot({ path: screenPath, fullPage: false });
-    console.log(`📸 已保存控制台快照: ${screenPath}`);
+    savedScreenshot = path.join('screenshots', `reset-${Date.now()}.png`);
+    await page.screenshot({ path: savedScreenshot, fullPage: false });
+    console.log(`📸 已保存控制台快照: ${savedScreenshot}`);
   } catch (e) {}
 
   return {
     success: resetClicked,
     before: beforeTimeStr,
-    after: afterTimeStr
+    after: afterTimeStr,
+    screenshot: savedScreenshot
   };
 }
 
@@ -220,7 +250,7 @@ async function extractExpiryTime(page) {
             const min = parseInt(m[3], 10);
             return { totalHours: d * 24 + h + min / 60, raw: `${d}天${h}小时${min}分` };
           }
-          container = header.parentElement;
+          container = container.parentElement;
         }
       }
     }
@@ -358,6 +388,7 @@ async function runOnce() {
 
   const page = await context.newPage();
   let reports = [];
+  let finalScreenshot = null;
 
   try {
     await doLogin(page, email, password);
@@ -373,6 +404,9 @@ async function runOnce() {
 
       // 1. 核心任务：Reset 在线保活
       const resetRes = await resetOnlineTimer(page);
+      if (resetRes.screenshot) {
+        finalScreenshot = resetRes.screenshot;
+      }
 
       // 2. 辅助任务：Plan 租期核对
       const billRes = await checkAndRenewBilling(page);
@@ -392,13 +426,16 @@ async function runOnce() {
       `<b>策略:</b> 40分钟周期在线 Reset + 46h门槛自动续期\n` +
       `<b>完成时间:</b> ` + nowStr;
 
-    await sendTG(tgToken, tgChatId, summary);
+    // 发送包含控制台实时截图的图文报告
+    await sendTG(tgToken, tgChatId, summary, finalScreenshot);
 
   } catch (err) {
     console.error('❌ 执行异常:', err.message);
     try {
       fs.mkdirSync('screenshots', { recursive: true });
-      await page.screenshot({ path: path.join('screenshots', `error-${Date.now()}.png`) });
+      const errShot = path.join('screenshots', `error-${Date.now()}.png`);
+      await page.screenshot({ path: errShot });
+      await sendTG(tgToken, tgChatId, `⚠️ <b>FreeMCHost 巡检异常</b>:\n${err.message}`, errShot);
     } catch (_) {}
   } finally {
     await browser.close();
