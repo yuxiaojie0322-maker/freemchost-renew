@@ -54,6 +54,16 @@ async function checkAndWakeServer(page) {
   return false;
 }
 
+// 时间分秒转秒数辅助函数
+function parseMinutesSeconds(str) {
+  if (!str) return 0;
+  const parts = str.split(':').map(Number);
+  if (parts.length === 2 && !isNaN(parts[0]) && !isNaN(parts[1])) {
+    return parts[0] * 60 + parts[1];
+  }
+  return 0;
+}
+
 // 核心功能：维持在线计时器，点击控制台上方 Reset 按钮
 async function resetOnlineTimer(page) {
   console.log('🔍 正在检测控制台在线倒计时状态...');
@@ -70,7 +80,7 @@ async function resetOnlineTimer(page) {
   await cleanPopup(page);
   await checkAndWakeServer(page);
 
-  // 关键优化：等待控制台 WebSocket 握手完毕并成功渲染出 Online 倒计时（最多等 15 秒）
+  // 等待控制台 WebSocket 连通与 Online 状态渲染
   console.log('⏳ 等待控制台 WebSocket 连通与 Online 状态渲染...');
   try {
     await page.waitForFunction(() => {
@@ -87,7 +97,8 @@ async function resetOnlineTimer(page) {
     return bodyMatch ? bodyMatch[1] : null;
   }) || '未识别到具体剩余';
 
-  console.log(`⏱️ 操作前在线倒计时: ${beforeTimeStr}`);
+  const beforeSeconds = parseMinutesSeconds(beforeTimeStr);
+  console.log(`⏱️ 操作前在线倒计时: ${beforeTimeStr} (${beforeSeconds}秒)`);
 
   // 3. 定位 Reset 按钮并执行点击
   let resetClicked = false;
@@ -106,7 +117,7 @@ async function resetOnlineTimer(page) {
     }
   } catch (e) {}
 
-  // 策略 B: 常见按钮/链接选择器备用
+  // 策略 B: 备用选择器
   if (!resetClicked) {
     const resetLocators = [
       page.locator('button:has-text("Reset")').first(),
@@ -156,24 +167,25 @@ async function resetOnlineTimer(page) {
     }
   }
 
-  // 4. 等待服务器回传并捕获重置后的倒计时
+  // 4. 等待后端处理并推送刷新后的倒计时（通常会跳变回 44~45 分钟满额）
   let afterTimeStr = null;
   console.log('⏳ 正在等待在线倒计时刷新确认...');
-  for (let round = 0; round < 8; round++) {
-    await page.waitForTimeout(800);
+  for (let round = 0; round < 10; round++) {
+    await page.waitForTimeout(1000);
     afterTimeStr = await page.evaluate(() => {
       const bodyMatch = (document.body.innerText || '').match(/Online\s*(\d+:\d+)/i);
       return bodyMatch ? bodyMatch[1] : null;
     });
-    // 如果倒计时发生变化（例如从 38:51 变成了 50:00 或更高），说明已刷新成功
-    if (afterTimeStr && afterTimeStr !== beforeTimeStr) {
-      console.log(`🎉 倒计时已成功变更为最新时间: ${afterTimeStr}`);
+    const afterSeconds = parseMinutesSeconds(afterTimeStr);
+    // 判断是否真正重置成功：时间应当显著拉长（大于之前时间且大于 40 分钟）
+    if (afterSeconds > beforeSeconds && afterSeconds >= 40 * 60) {
+      console.log(`🎉 倒计时已成功变更为重置后满额时间: ${afterTimeStr}`);
       resetClicked = true;
       break;
     }
   }
 
-  afterTimeStr = afterTimeStr || beforeTimeStr || '已提交刷新';
+  afterTimeStr = afterTimeStr || beforeTimeStr || '45:00';
   console.log(`✅ 在线状态重置流程完成: [${beforeTimeStr}] ➔ [${afterTimeStr}] (${resetClicked ? '成功' : '未触发'})`);
 
   // 保存操作后的控制台凭据截图
@@ -194,7 +206,6 @@ async function resetOnlineTimer(page) {
 // 提取 Plan Billing 页面中的到期时间（天/时/分）
 async function extractExpiryTime(page) {
   return await page.evaluate(() => {
-    // 方案 1: 查找 TIME UNTIL EXPIRY
     const allEls = Array.from(document.querySelectorAll('*'));
     const header = allEls.find(el => el && el.textContent && el.textContent.trim().toUpperCase() === 'TIME UNTIL EXPIRY');
     if (header) {
@@ -209,12 +220,11 @@ async function extractExpiryTime(page) {
             const min = parseInt(m[3], 10);
             return { totalHours: d * 24 + h + min / 60, raw: `${d}天${h}小时${min}分` };
           }
-          container = container.parentElement;
+          container = header.parentElement;
         }
       }
     }
 
-    // 方案 2: 全局正则匹配
     const bodyText = document.body.innerText || '';
     const m = bodyText.match(/(\d{1,3})\s*D\s*(\d{1,2})\s*H\s*(\d{1,2})\s*M/i);
     if (m) {
@@ -285,7 +295,6 @@ async function doLogin(page, email, password) {
   await page.waitForTimeout(1500);
   await cleanPopup(page);
 
-  // 检查是否已经处于登录态
   if (!page.url().includes('/login')) {
     console.log('✅ 已处于登录状态');
     return;
@@ -411,7 +420,6 @@ async function runOnce() {
       await new Promise(r => setTimeout(r, intervalMinutes * 60 * 1000));
     }
   } else {
-    // 默认单次执行（用于 GitHub Actions 工作流）
     await runOnce();
   }
 })();
