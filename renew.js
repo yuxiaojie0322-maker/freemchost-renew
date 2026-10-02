@@ -1,6 +1,8 @@
 const { chromium } = require('playwright');
+const fs = require('fs');
+const path = require('path');
 
-// Telegram 通知
+// Telegram 消息推送
 async function sendTG(botToken, chatId, text) {
   if (!botToken || !chatId) return;
   try {
@@ -9,31 +11,178 @@ async function sendTG(botToken, chatId, text) {
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ chat_id: chatId, text, parse_mode: 'HTML' })
     });
-  } catch (e) {}
+    console.log('📨 Telegram 状态推送成功');
+  } catch (e) {
+    console.log('⚠️ Telegram 推送失败:', e.message);
+  }
 }
 
-// 顺手关掉可能出现的打分弹窗
+// 顺手关闭可能会遮挡点击的弹窗与横幅
 async function cleanPopup(page) {
   try {
-    const later = page.locator('text="Maybe later"').first();
-    if (await later.isVisible({ timeout: 200 })) {
-      await later.click();
-      console.log('🛡️ 顺手关闭了 Maybe later 弹窗');
-      await page.waitForTimeout(300);
+    const selectors = [
+      'text="Maybe later"',
+      'button:has-text("Maybe later")',
+      'button:has-text("Accept")',
+      'button:has-text("I understand")',
+      'button:has-text("Dismiss")'
+    ];
+    for (const sel of selectors) {
+      const el = page.locator(sel).first();
+      if (await el.isVisible({ timeout: 150 }).catch(() => false)) {
+        await el.click().catch(() => {});
+        console.log(`🧹 顺手关闭遮挡弹窗: ${sel}`);
+        await page.waitForTimeout(200);
+      }
     }
   } catch (e) {}
 }
 
-// 格式化时长字符串，清洗掉多余的换行与空格
-function formatTimeString(raw) {
-  if (!raw) return '未知';
-  return raw.replace(/[\r\n\t]+/g, ' ').replace(/\s+/g, ' ').trim();
+// 唤醒处于休眠/关机状态的服务器（如果是 Offline 状态自动点 Start）
+async function checkAndWakeServer(page) {
+  try {
+    const startBtn = page.locator('button:has-text("Start"), div[role="button"]:has-text("Start")').first();
+    if (await startBtn.isVisible({ timeout: 1500 }).catch(() => false)) {
+      console.log('⚡ 检测到服务器处于离线状态，正在点击【Start】唤醒服务器...');
+      await startBtn.click({ force: true }).catch(() => {});
+      await page.waitForTimeout(5000);
+      await cleanPopup(page);
+      console.log('🚀 已触发开机唤醒');
+      return true;
+    }
+  } catch (e) {}
+  return false;
 }
 
-// 从当前页面精确提取倒计时（优先从专用容器提取）
+// 核心功能：维持在线计时器，点击控制台上方 Reset 按钮
+async function resetOnlineTimer(page) {
+  console.log('🔍 正在检测控制台在线倒计时状态...');
+
+  // 1. 确保停留在 Console 控制台页面
+  try {
+    const consoleTab = page.locator('[role="tab"]:has-text("Console"), button:has-text("Console"), a:has-text("Console")').first();
+    if (await consoleTab.isVisible({ timeout: 2000 }).catch(() => false)) {
+      await consoleTab.click({ force: true }).catch(() => {});
+      await page.waitForTimeout(1200);
+    }
+  } catch (e) {}
+
+  await cleanPopup(page);
+  await checkAndWakeServer(page);
+
+  // 2. 提取当前 Online 倒计时信息
+  const timerInfo = await page.evaluate(() => {
+    const allEls = Array.from(document.querySelectorAll('*'));
+    // 寻找包含 Online 字样的元素
+    const onlineEl = allEls.find(el => {
+      const text = (el.innerText || el.textContent || '').trim();
+      return /Online\s+\d+:\d+/i.test(text) && text.length < 60;
+    });
+
+    if (onlineEl) {
+      const m = onlineEl.textContent.match(/Online\s*(\d+:\d+)/i);
+      return {
+        found: true,
+        text: onlineEl.textContent.trim(),
+        time: m ? m[1] : null
+      };
+    }
+
+    // 兜底找 body 全文
+    const bodyMatch = (document.body.innerText || '').match(/Online\s*(\d+:\d+)/i);
+    if (bodyMatch) {
+      return { found: true, text: bodyMatch[0], time: bodyMatch[1] };
+    }
+
+    return { found: false, text: null, time: null };
+  });
+
+  const beforeTimeStr = timerInfo.found ? (timerInfo.time || timerInfo.text) : '未识别到具体剩余';
+  console.log(`⏱️ 操作前在线倒计时: ${beforeTimeStr}`);
+
+  // 3. 定位 Reset 按钮并执行点击
+  let resetClicked = false;
+
+  // 策略 A: 优先查找包含 Reset 文本的可交互按钮/链接
+  const resetLocators = [
+    page.locator('button:has-text("Reset")').first(),
+    page.locator('a:has-text("Reset")').first(),
+    page.locator('[role="button"]:has-text("Reset")').first(),
+    page.locator('span:has-text("Reset")').first(),
+    page.locator('div:has-text("Reset")').filter({ hasText: /^Reset$/ }).first()
+  ];
+
+  for (const loc of resetLocators) {
+    try {
+      if (await loc.isVisible({ timeout: 1000 })) {
+        console.log('🎯 定位到 Reset 按钮，准备模拟用户点击...');
+        await loc.scrollIntoViewIfNeeded().catch(() => {});
+        await loc.hover().catch(() => {});
+        await page.waitForTimeout(250);
+        await loc.click({ force: true });
+        resetClicked = true;
+        console.log('👆 已成功触发 Reset 按钮点击！');
+        break;
+      }
+    } catch (e) {}
+  }
+
+  // 策略 B: 深度 DOM 探测靠近 Online 节点的 Reset 元素
+  if (!resetClicked) {
+    console.log('🔄 尝试通过 DOM 树结构穿透定位 Reset 元素...');
+    const clickedByEval = await page.evaluate(() => {
+      const elements = Array.from(document.querySelectorAll('*'));
+      for (const el of elements) {
+        const text = (el.innerText || el.textContent || '').trim();
+        if (text.toLowerCase() === 'reset' && el.children.length === 0) {
+          const rect = el.getBoundingClientRect();
+          if (rect.width > 0 && rect.height > 0) {
+            el.click();
+            return true;
+          }
+        }
+      }
+      return false;
+    });
+
+    if (clickedByEval) {
+      resetClicked = true;
+      console.log('👆 通过 DOM 深度定位成功执行 Reset 点击！');
+    }
+  }
+
+  // 缓冲等待 3 秒使服务器刷新倒计时
+  await page.waitForTimeout(3000);
+  await cleanPopup(page);
+
+  // 4. 再次获取点击后的倒计时
+  const afterTimerInfo = await page.evaluate(() => {
+    const bodyMatch = (document.body.innerText || '').match(/Online\s*(\d+:\d+)/i);
+    return bodyMatch ? bodyMatch[1] : null;
+  });
+
+  const afterTimeStr = afterTimerInfo || '已提交刷新';
+  console.log(`✅ 在线状态重置完成: [${beforeTimeStr}] ➔ [${afterTimeStr}]`);
+
+  // 保存操作后的控制台凭据截图
+  try {
+    fs.mkdirSync('screenshots', { recursive: true });
+    const screenPath = path.join('screenshots', `reset-${Date.now()}.png`);
+    await page.screenshot({ path: screenPath, fullPage: false });
+    console.log(`📸 已保存控制台快照: ${screenPath}`);
+  } catch (e) {}
+
+  return {
+    success: resetClicked,
+    before: beforeTimeStr,
+    after: afterTimeStr
+  };
+}
+
+// 提取 Plan Billing 页面中的到期时间（天/时/分）
 async function extractExpiryTime(page) {
   return await page.evaluate(() => {
-    // 方案 1: 从 TIME UNTIL EXPIRY 下方卡片精准提取
+    // 方案 1: 查找 TIME UNTIL EXPIRY
     const allEls = Array.from(document.querySelectorAll('*'));
     const header = allEls.find(el => el && el.textContent && el.textContent.trim().toUpperCase() === 'TIME UNTIL EXPIRY');
     if (header) {
@@ -48,12 +197,12 @@ async function extractExpiryTime(page) {
             const min = parseInt(m[3], 10);
             return { totalHours: d * 24 + h + min / 60, raw: `${d}天${h}小时${min}分` };
           }
-          container = container.parentElement;
+          container = header.parentElement;
         }
       }
     }
 
-    // 方案 2: 全局正则兜底匹配
+    // 方案 2: 全局正则匹配
     const bodyText = document.body.innerText || '';
     const m = bodyText.match(/(\d{1,3})\s*D\s*(\d{1,2})\s*H\s*(\d{1,2})\s*M/i);
     if (m) {
@@ -66,18 +215,113 @@ async function extractExpiryTime(page) {
   });
 }
 
-(async () => {
-  const email = (process.env.FREE_EMAIL || '').trim();
-  const password = process.env.FREE_PASSWORD || '';
-  const rawUrls = (process.env.SERVER_PAGE_URL || '').trim();
+// 兼顾原有的 Plan 租期检查（每当 < 46h 顺便续期 60 小时，双重保活）
+async function checkAndRenewBilling(page) {
+  try {
+    console.log('👉 顺便切换至 PLAN Billing 核对长效租期...');
+    const billingTab = page.locator('[role="tab"]:has-text("Billing"), button:has-text("PLAN")').last();
+    if (await billingTab.isVisible({ timeout: 2500 }).catch(() => false)) {
+      await billingTab.scrollIntoViewIfNeeded().catch(() => {});
+      await billingTab.click({ force: true });
+      await page.waitForTimeout(2000);
+      await cleanPopup(page);
+
+      const timeData = await extractExpiryTime(page);
+      const beforeTime = timeData ? timeData.raw : '未获取到';
+      const remainHours = timeData ? timeData.totalHours : 99;
+      console.log(`⏱️ 租期剩余时长: ${beforeTime} (约 ${remainHours.toFixed(1)}h)`);
+
+      if (remainHours < 46) {
+        console.log('🎯 租期 < 46 小时，执行 60h 长效免费续期...');
+        const renewNowBtn = page.locator('button:has-text("Renew now")').first();
+        if (await renewNowBtn.isVisible({ timeout: 5000 })) {
+          await renewNowBtn.click({ force: true });
+          await page.waitForTimeout(1500);
+          await cleanPopup(page);
+
+          console.log('⏳ 停留 8 秒生成防刷签名 dwell_ms...');
+          for (let sec = 0; sec < 8; sec++) {
+            await cleanPopup(page);
+            await page.mouse.move(960 + sec * 5, 540 + sec * 3);
+            await page.waitForTimeout(1000);
+          }
+
+          const card = page.locator('div, button').filter({ hasText: '60 hours' }).last();
+          if (await card.isEnabled({ timeout: 3000 }).catch(() => false)) {
+            await card.hover();
+            await page.waitForTimeout(300);
+            await card.click({ force: true });
+            console.log('👆 60h 租期续期成功！');
+            await page.waitForTimeout(5000);
+            return { executed: true, status: '已成功加时 (+60h)' };
+          }
+        }
+      } else {
+        return { executed: false, status: `剩余 ${beforeTime} (租期充足无需加时)` };
+      }
+    }
+  } catch (e) {
+    console.log(`⚠️ 租期检查过程跳过: ${e.message}`);
+  }
+  return { executed: false, status: '已跳过租期检查' };
+}
+
+// 登录模块
+async function doLogin(page, email, password) {
+  console.log('🔑 正在登录 FreeMCHost...');
+  await page.goto('https://freemchost.com/login', { waitUntil: 'domcontentloaded', timeout: 45000 });
+  await page.waitForTimeout(1500);
+  await cleanPopup(page);
+
+  // 检查是否已经处于登录态
+  if (!page.url().includes('/login')) {
+    console.log('✅ 已处于登录状态');
+    return;
+  }
+
+  const emailInput = page.locator('input[type="email"]').first();
+  await emailInput.waitFor({ state: 'visible', timeout: 15000 });
+  await emailInput.click();
+  await emailInput.fill(email);
+
+  const passInput = page.locator('input[type="password"]').first();
+  await passInput.click();
+  await passInput.fill(password);
+  await page.waitForTimeout(300);
+
+  const signInBtn = page.locator('button[type="submit"]:has-text("Sign in")').first();
+  await signInBtn.click();
+
+  let loggedIn = false;
+  for (let wait = 0; wait < 20; wait++) {
+    await page.waitForTimeout(1000);
+    const curUrl = page.url();
+    if (!curUrl.includes('/login')) {
+      loggedIn = true;
+      break;
+    }
+    await cleanPopup(page);
+  }
+
+  if (!loggedIn) {
+    throw new Error('登录未成功跳转，请检查账号密码或是否有验证码拦截');
+  }
+  console.log('🎉 登录成功！');
+}
+
+// 执行单次巡检与保活
+async function runOnce() {
+  const email = (process.env.FREE_EMAIL || 'yuxiaojie0322@gmail.com').trim();
+  const password = process.env.FREE_PASSWORD || 'YxJ223512@';
+  const rawUrls = (process.env.SERVER_PAGE_URL || 'https://freemchost.com/app/servers/1df49f71-bb1b-454c-9cd1-70a46422a4f6').trim();
   const proxyUrl = (process.env.PROXY_URL || '').trim();
   const tgToken = (process.env.TG_BOT_TOKEN || '').trim();
   const tgChatId = (process.env.TG_CHAT_ID || '').trim();
 
   const serverUrls = rawUrls.split(/[\r\n,]+/).map(u => u.trim()).filter(u => u.startsWith('http'));
   if (!email || !password || serverUrls.length === 0) {
-    console.error('❌ 缺失账号、密码或服务器地址！');
-    process.exit(1);
+    console.error('❌ 缺失必要的账号或服务器地址配置');
+    return;
   }
 
   const browser = await chromium.launch({
@@ -86,133 +330,76 @@ async function extractExpiryTime(page) {
     proxy: proxyUrl ? { server: proxyUrl } : undefined
   });
 
-  const page = await browser.newPage({
+  const context = await browser.newContext({
     viewport: { width: 1920, height: 1080 },
-    userAgent: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36'
+    userAgent: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36'
   });
 
+  const page = await context.newPage();
   let reports = [];
 
   try {
-    console.log('🚀 正在登录...');
-    await page.goto('https://freemchost.com/login', { waitUntil: 'domcontentloaded' });
-    await page.waitForTimeout(1500);
-    await cleanPopup(page);
-
-    const emailInput = page.locator('input[type="email"]').first();
-    await emailInput.click();
-    await emailInput.fill(email);
-
-    const passInput = page.locator('input[type="password"]').first();
-    await passInput.click();
-    await passInput.fill(password);
-    await page.waitForTimeout(300);
-
-    const signInBtn = page.locator('button[type="submit"]:has-text("Sign in")').first();
-    await signInBtn.click();
-
-    let loggedIn = false;
-    for (let wait = 0; wait < 15; wait++) {
-      await page.waitForTimeout(1000);
-      const curUrl = page.url();
-      if (!curUrl.includes('/login')) {
-        loggedIn = true;
-        break;
-      }
-      await cleanPopup(page);
-    }
-
-    if (!loggedIn) {
-      throw new Error('登录未跳转，可能密码错误或被验证码拦截');
-    }
-    console.log('✅ 登录成功！');
+    await doLogin(page, email, password);
 
     for (let i = 0; i < serverUrls.length; i++) {
       const url = serverUrls[i];
       const sIndex = i + 1;
-      console.log(`\n================= 正在巡检服务器 [${sIndex}/${serverUrls.length}] =================`);
+      console.log(`\n================= 正在执行第 [${sIndex}/${serverUrls.length}] 台服务器保活 =================`);
 
-      await page.goto(url, { waitUntil: 'domcontentloaded' });
+      await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 45000 });
       await page.waitForTimeout(2500);
       await cleanPopup(page);
 
-      // 精准定位 PLAN Billing 标签页
-      console.log('👉 切换至 PLAN Billing 页面...');
-      const billingTab = page.locator('[role="tab"]:has-text("Billing"), button:has-text("PLAN")').last();
-      await billingTab.scrollIntoViewIfNeeded().catch(() => {});
-      await billingTab.click({ force: true });
-      await page.waitForTimeout(2000);
-      await cleanPopup(page);
+      // 1. 核心任务：Reset 在线保活
+      const resetRes = await resetOnlineTimer(page);
 
-      // 读取当前时间
-      const timeData = await extractExpiryTime(page);
-      const beforeTime = timeData ? timeData.raw : '未获取到';
-      const remainHours = timeData ? timeData.totalHours : 99;
-      console.log(`⏱️ 操作前剩余时长: ${beforeTime} (约 ${remainHours.toFixed(1)}h)`);
+      // 2. 辅助任务：Plan 租期核对
+      const billRes = await checkAndRenewBilling(page);
 
-      // 只有剩余时长 < 46h 时才触发续期
-      if (remainHours < 46) {
-        console.log('🎯 剩余时长 < 46 小时，打开续期弹窗...');
-        const renewNowBtn = page.locator('button:has-text("Renew now")').first();
-        await renewNowBtn.waitFor({ state: 'visible', timeout: 10000 });
-        await renewNowBtn.click({ force: true });
-        await page.waitForTimeout(1500);
-        await cleanPopup(page);
-
-        // 核心延迟缓冲：保持弹窗停留 8 秒，生成防刷签名与 dwell_ms
-        console.log('⏳ 保持弹窗停留 8 秒，累积交互计时与签名生成...');
-        for (let sec = 0; sec < 8; sec++) {
-          await cleanPopup(page);
-          await page.mouse.move(960 + sec * 5, 540 + sec * 3);
-          await page.waitForTimeout(1000);
-        }
-
-        console.log('👉 检查 [60 hours] 选项框...');
-        const card = page.locator('div, button').filter({ hasText: '60 hours' }).last();
-        const canClick = await card.isEnabled({ timeout: 2000 }).catch(() => false);
-
-        if (canClick) {
-          console.log('✅ 选项已就绪，执行物理点击...');
-          await card.hover();
-          await page.waitForTimeout(400);
-          await card.click({ force: true });
-          console.log('👆 点击完成！');
-
-          console.log('⏳ 等待后端入库事务处理 (8 秒)...');
-          await page.waitForTimeout(8000);
-          await cleanPopup(page);
-
-          // 刷新当前页面查看真实加时状态
-          console.log('🔄 刷新页面核对最新时长...');
-          await page.reload({ waitUntil: 'domcontentloaded' });
-          await page.waitForTimeout(2000);
-          await cleanPopup(page);
-          await page.locator('[role="tab"]:has-text("Billing"), button:has-text("PLAN")').last().click({ force: true }).catch(() => {});
-          await page.waitForTimeout(1500);
-
-          const afterTimeData = await extractExpiryTime(page);
-          const afterTime = afterTimeData ? afterTimeData.raw : '已完成加时';
-
-          reports.push(`🟢 <b>服务器 ${sIndex}</b>: 成功续期 (+60h)\n     └ 状态: ${beforeTime} ➔ <b>${afterTime}</b>`);
-        } else {
-          console.log('⏳ 选项未解锁，无需点击。');
-          await page.locator('button:has-text("✕"), [aria-label="Close"], button:has-text("Close")').first().click().catch(() => {});
-          reports.push(`⚪ <b>服务器 ${sIndex}</b>: 剩余 <b>${beforeTime}</b> (未到门槛，保持等待)`);
-        }
-      } else {
-        console.log(`⏳ 剩余时长 ${beforeTime} (${remainHours.toFixed(1)}h > 46h)，安全充足，无需操作。`);
-        reports.push(`⚪ <b>服务器 ${sIndex}</b>: 剩余 <b>${beforeTime}</b> (安全充足，保持等待)`);
-      }
+      reports.push(
+        `🖥️ <b>服务器 ${sIndex}</b>:\n` +
+        `   ⌛ <b>在线重置</b>: ${resetRes.before} ➔ <b>${resetRes.after}</b> (${resetRes.success ? '成功' : '未触发'})\n` +
+        `   📅 <b>长效租期</b>: ${billRes.status}`
+      );
     }
 
-    // 格式化输出简洁干净的通知
-    const summary = `🤖 <b>FreeMCHost 巡检报告</b>\n\n${reports.join('\n\n')}\n\n<b>检查规则:</b> 低于 46h 门槛时自动激活续期\n<b>更新时间:</b> ${new Date().toLocaleString('zh-CN', { timeZone: 'Asia/Shanghai' })}`;
+    // 格式化输出推送报告
+    const nowStr = new Date().toLocaleString('zh-CN', { timeZone: 'Asia/Shanghai' });
+    const summary =
+      `🤖 <b>FreeMCHost 在线保活巡检完成</b>\n\n` +
+      reports.join('\n\n') + '\n\n' +
+      `<b>策略:</b> 40分钟周期在线 Reset + 46h门槛自动续期\n` +
+      `<b>完成时间:</b> ` + nowStr;
+
     await sendTG(tgToken, tgChatId, summary);
 
   } catch (err) {
     console.error('❌ 执行异常:', err.message);
+    try {
+      fs.mkdirSync('screenshots', { recursive: true });
+      await page.screenshot({ path: path.join('screenshots', `error-${Date.now()}.png`) });
+    } catch (_) {}
   } finally {
     await browser.close();
-    console.log('🏁 完成并关闭浏览器。');
+    console.log('🏁 本轮保活任务结束\n');
+  }
+}
+
+// 主入口：支持单次执行（GitHub Actions/Cron）和常驻循环挂机（40分钟/次）
+(async () => {
+  const isLoop = process.env.LOOP_MODE === 'true' || process.argv.includes('--loop');
+  const intervalMinutes = parseInt(process.env.INTERVAL_MINUTES || '40', 10);
+
+  if (isLoop) {
+    console.log(`🔄 已开启常驻挂机模式：每隔 ${intervalMinutes} 分钟自动执行一次 Reset...`);
+    while (true) {
+      console.log(`\n[${new Date().toLocaleTimeString()}] 开始执行巡检...`);
+      await runOnce();
+      console.log(`⏳ 本轮完成，挂机休眠 ${intervalMinutes} 分钟...`);
+      await new Promise(r => setTimeout(r, intervalMinutes * 60 * 1000));
+    }
+  } else {
+    // 默认单次执行（用于 GitHub Actions 工作流）
+    await runOnce();
   }
 })();
