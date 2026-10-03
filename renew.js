@@ -216,14 +216,40 @@ async function resetOnlineTimer(page) {
   afterTimeStr = afterTimeStr || beforeTimeStr || '45:00';
   console.log(`✅ 在线状态重置流程完成: [${beforeTimeStr}] ➔ [${afterTimeStr}] (${resetClicked ? '成功' : '未触发'})`);
 
-  // 保存操作后的控制台凭据截图
+  // 保存操作后的控制台凭据截图（优化：仅裁剪保留顶部时间状态横条，清晰精简）
   let savedScreenshot = null;
   try {
     fs.mkdirSync('screenshots', { recursive: true });
     savedScreenshot = path.join('screenshots', `reset-${Date.now()}.png`);
-    await page.screenshot({ path: savedScreenshot, fullPage: false });
-    console.log(`📸 已保存控制台快照: ${savedScreenshot}`);
-  } catch (e) {}
+
+    // 优先精确定位包含 Online 状态栏的容器
+    const onlineBadge = page.locator('*:has-text("Online")').filter({ hasText: /Online\s+\d+:\d+/ }).last();
+    let clipped = false;
+
+    if (await onlineBadge.isVisible({ timeout: 2000 }).catch(() => false)) {
+      const box = await onlineBadge.boundingBox();
+      if (box && box.width > 0 && box.height > 0) {
+        // 围绕时间胶囊向左右和上下扩展，只截取 Connected 和 Online XX:XX Reset 区域
+        const clipX = Math.max(0, box.x - 120);
+        const clipY = Math.max(0, box.y - 12);
+        const clipW = Math.min(680, box.width + 240);
+        const clipH = Math.max(48, box.height + 24);
+
+        await page.screenshot({
+          path: savedScreenshot,
+          clip: { x: clipX, y: clipY, width: clipW, height: clipH }
+        });
+        clipped = true;
+      }
+    }
+
+    if (!clipped) {
+      await page.screenshot({ path: savedScreenshot, fullPage: false });
+    }
+    console.log(`📸 已保存精简时间截图: ${savedScreenshot}`);
+  } catch (e) {
+    console.log('⚠️ 截图裁剪处理异常:', e.message);
+  }
 
   return {
     success: resetClicked,
@@ -426,7 +452,7 @@ async function runOnce() {
       `<b>策略:</b> 40分钟周期在线 Reset + 46h门槛自动续期\n` +
       `<b>完成时间:</b> ` + nowStr;
 
-    // 发送包含控制台实时截图的图文报告
+    // 发送包含精简横条截图的图文报告
     await sendTG(tgToken, tgChatId, summary, finalScreenshot);
 
   } catch (err) {
