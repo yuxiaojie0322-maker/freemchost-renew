@@ -2,9 +2,7 @@ name: Freemchost Auto Renew & Keepalive
 
 on:
   workflow_dispatch:
-  schedule:
-    # 每 35 分钟自动执行一次，防止 40~50 分钟在线倒计时清零关机
-    - cron: '*/35 * * * *'
+  # schedule 定时已交由外部白虎面板精准触发，避免 GitHub 队列调度延迟
 
 permissions:
   actions: write
